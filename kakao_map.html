@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>베비고 지도</title>
+<!--
+  베비고 앱의 지도 화면 (카카오맵). Flutter 앱이 이 페이지를 띄우고 메시지로 마커를 주고받는다.
+    - 웹 미리보기: 앱 페이지 안의 iframe (같은 주소에서만 메시지 허용)
+    - 아이폰 앱: WebView 로 이 페이지의 배포 주소를 열고 BabygoMap 채널로 통신
+  앱 → 지도: {cmd:'items', layer:'place'|'event', items:[{id,lat,lng,color,label,count}]}
+             {cmd:'layer', layer, visible} {cmd:'fit', s,w,n,e, top,bottom} {cmd:'view', lat,lng,level} {cmd:'focus', layer,id}
+  지도 → 앱: {ev:'ready'} {ev:'error', msg} {ev:'tap', layer,id} {ev:'idle', s,w,n,e,level} {ev:'drag'} {ev:'click'}
+  카카오 JavaScript 키는 주소의 ?key= 로 받음 (공개 키. 카카오 개발자 콘솔에 이 페이지의 도메인 등록 필요)
+-->
+<style>
+  html, body, #map { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #e8efed; }
+  body.dark, body.dark #map { background: #14191c; }
+  .mk {
+    min-width: 30px; height: 30px; padding: 0 4px; box-sizing: border-box; border-radius: 15px;
+    display: flex; align-items: center; justify-content: center; gap: 2px;
+    font: 15px/1 -apple-system, "Apple SD Gothic Neo", sans-serif; color: #3d4a50;
+    border: 2.5px solid #fff; box-shadow: 0 2px 6px rgba(40, 70, 65, .35); cursor: pointer;
+    -webkit-tap-highlight-color: transparent; user-select: none;
+  }
+  .mk .n { font-size: 11px; font-weight: 800; background: #fff; border-radius: 8px; padding: 1px 4px; }
+  .mk.sel { transform: scale(1.25); box-shadow: 0 0 0 3px rgba(47, 143, 126, .55), 0 3px 8px rgba(0,0,0,.35); }
+  #err { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; text-align: center;
+         font: 14px/1.5 -apple-system, sans-serif; color: #8d9aa0; padding: 24px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="err"></div>
+<script>
+(function () {
+  const params = new URLSearchParams(location.search);
+  const KEY = params.get("key") || "";
+  if (params.get("dark") === "1") document.body.classList.add("dark");
+
+  // ---- 앱과 통신 ----
+  function send(msg) {
+    if (window.BabygoMap && window.BabygoMap.postMessage) window.BabygoMap.postMessage(JSON.stringify(msg));
+    else if (window.parent !== window) window.parent.postMessage({ babygo: msg }, location.origin);
+  }
+  const queue = [];
+  let handle = m => queue.push(m);
+  window.bgReceive = m => handle(typeof m === "string" ? JSON.parse(m) : m);  // 아이폰 앱: runJavaScript 로 호출
+  window.addEventListener("message", e => {                                   // 웹 미리보기: 같은 주소의 부모 창만
+    if (e.origin === location.origin && e.data && e.data.babygoCmd) window.bgReceive(e.data.babygoCmd);
+  });
+
+  function fail(msg) {
+    const el = document.getElementById("err");
+    el.textContent = msg; el.style.display = "flex";
+    send({ ev: "error", msg });
+  }
+  if (!KEY) return fail("지도 키가 설정되지 않았어요");
+
+  const s = document.createElement("script");
+  s.src = "https://dapi.kakao.com/v2/maps/sdk.js?autoload=false&libraries=clusterer&appkey=" + encodeURIComponent(KEY);
+  s.onerror = () => fail("지도를 불러오지 못했어요. 인터넷 연결을 확인해 주세요.");
+  s.onload = () => kakao.maps.load(start);
+  document.head.appendChild(s);
+  const timer = setTimeout(() => fail("지도를 불러오지 못했어요. (카카오 개발자 콘솔의 도메인 등록을 확인해 주세요)"), 10000);
+
+  function start() {
+    clearTimeout(timer);
+    const K = kakao.maps;
+    const map = new K.Map(document.getElementById("map"), { center: new K.LatLng(36.3, 127.8), level: 13 });
+    K.event.addListener(map, "idle", () => {
+      const b = map.getBounds(), sw = b.getSouthWest(), ne = b.getNorthEast();
+      send({ ev: "idle", s: sw.getLat(), w: sw.getLng(), n: ne.getLat(), e: ne.getLng(), level: map.getLevel() });
+    });
+    K.event.addListener(map, "dragstart", () => send({ ev: "drag" }));
+    K.event.addListener(map, "click", () => send({ ev: "click" }));
+
+    // 같은 좌표(같은 건물)는 아주 조금(약 6m) 벌려서 겹치지 않게
+    function spread(items) {
+      const groups = new Map(), out = [];
+      items.forEach(it => {
+        const k = it.lat.toFixed(5) + "," + it.lng.toFixed(5);
+        if (!groups.has(k)) groups.set(k, []);
+        groups.get(k).push(it);
+      });
+      groups.forEach(list => list.forEach((it, i) => {
+        if (list.length === 1) return out.push({ ...it, plat: it.lat, plng: it.lng });
+        const a = (2 * Math.PI * i) / list.length, r = 0.00006;
+        out.push({ ...it, plat: it.lat + r * Math.sin(a), plng: it.lng + r * Math.cos(a) / Math.cos(it.lat * Math.PI / 180) });
+      }));
+      return out;
+    }
+    const esc = t => String(t == null ? "" : t).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    const safeColor = c => /^#[0-9a-fA-F]{3,8}$/.test(c || "") ? c : "#a2ded2";
+
+    function makeLayer(name) {
+      const ev = name === "event";
+      const clusterer = new K.MarkerClusterer({
+        map: null, averageCenter: true, minLevel: 6, gridSize: 60,
+        styles: [{ width: ev ? "54px" : "40px", height: "40px", background: ev ? "rgba(233,125,166,.92)" : "rgba(47,143,126,.88)",
+                   color: "#fff", borderRadius: "20px", textAlign: "center", lineHeight: "40px", fontWeight: "800", fontSize: "14px",
+                   border: "3px solid rgba(255,255,255,.85)" }],
+      });
+      K.event.addListener(clusterer, "clustered", clusters => clusters.forEach(cl => {
+        try {
+          const sum = cl.getMarkers().reduce((t, ov) => t + (ov.__count || 1), 0);
+          const node = cl.getClusterMarker().getContent();
+          if (node && node.nodeType === 1) node.textContent = ev ? "🎪 " + sum : String(sum);
+        } catch (e) { /* 기본 숫자 유지 */ }
+      }));
+      let overlays = [], byId = new Map(), visible = false;
+      const takeDown = () => { clusterer.clear(); overlays.forEach(o => o.setMap(null)); };
+      return {
+        set(items) {
+          takeDown();
+          byId = new Map();
+          overlays = spread(items || []).map(it => {
+            const node = document.createElement("div");
+            node.className = "mk";
+            node.style.background = safeColor(it.color);
+            node.innerHTML = esc(it.label) + (it.count > 1 ? '<span class="n">' + Number(it.count) + "</span>" : "");
+            node.addEventListener("click", e => { e.stopPropagation(); select(name, it.id); send({ ev: "tap", layer: name, id: it.id }); });
+            const ov = new K.CustomOverlay({ position: new K.LatLng(it.plat, it.plng), content: node, yAnchor: 0.5, clickable: true });
+            ov.__count = it.count || 1;
+            byId.set(it.id, { it, node });
+            return ov;
+          });
+          if (visible) clusterer.addMarkers(overlays);
+        },
+        show(on) {
+          if (on === visible) return;
+          visible = on;
+          if (on) { clusterer.setMap(map); clusterer.addMarkers(overlays); } else { takeDown(); clusterer.setMap(null); }
+        },
+        get: id => byId.get(id),
+        nodes: () => byId,
+      };
+    }
+    const layers = { place: makeLayer("place"), event: makeLayer("event") };
+    function select(layer, id) {
+      Object.values(layers).forEach(l => l.nodes().forEach(v => v.node.classList.remove("sel")));
+      const v = layers[layer] && layers[layer].get(id);
+      if (v) v.node.classList.add("sel");
+    }
+
+    handle = m => {
+      try {
+        if (m.cmd === "items") layers[m.layer].set(m.items);
+        else if (m.cmd === "layer") layers[m.layer].show(!!m.visible);
+        else if (m.cmd === "relayout") map.relayout();
+        else if (m.cmd === "view") { map.setLevel(m.level); map.setCenter(new K.LatLng(m.lat, m.lng)); }
+        else if (m.cmd === "select") select(m.layer, m.id);
+        else if (m.cmd === "focus") {
+          const v = layers[m.layer] && layers[m.layer].get(m.id);
+          if (!v) return;
+          map.setLevel(Math.min(map.getLevel(), m.level || 4));
+          // 아래 정보 카드에 가리지 않게 마커를 화면 위쪽(1/3)에 둠
+          const proj = map.getProjection(), pt = proj.pointFromCoords(new K.LatLng(v.it.plat, v.it.plng));
+          const h = document.getElementById("map").clientHeight;
+          map.setCenter(proj.coordsFromPoint(new K.Point(pt.x, pt.y + h * (m.offset || 0.18))));
+          select(m.layer, m.id);
+        } else if (m.cmd === "fit") {
+          const b = new K.LatLngBounds(new K.LatLng(m.s, m.w), new K.LatLng(m.n, m.e));
+          map.setBounds(b, m.top || 60, 8, m.bottom || 60, 8);
+        }
+      } catch (e) { send({ ev: "error", msg: String(e && e.message || e) }); }
+    };
+    queue.splice(0).forEach(handle);
+    send({ ev: "ready" });
+  }
+})();
+</script>
+</body>
+</html>
